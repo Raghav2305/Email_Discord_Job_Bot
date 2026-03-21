@@ -111,7 +111,7 @@ async function getMessages(auth, query) {
     const res = await gmail.users.messages.list({
         userId: 'me',
         q: query, // Apply the query here
-        maxResults: 1, // Limit the number of messages to fetch for testing
+        maxResults: 3, // Limit the number of messages to fetch for testing
     });
     const messages = res.data.messages;
 

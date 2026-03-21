@@ -1,8 +1,11 @@
 // discord_bot/index.js
 require('dotenv').config();
-const { Client, GatewayIntentBits } = require('discord.js');
+const fs = require('fs').promises;
+const path = require('path');
+const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
 const { authorize, getMessages } = require('../gmail_service');
 const { processEmailWithAI } = require('../ai_agent');
+const { convert } = require('html-to-text'); // Import html-to-text
 
 const client = new Client({
     intents: [
@@ -12,57 +15,221 @@ const client = new Client({
     ],
 });
 
+let scanInterval = null;
+const KEYWORDS_PATH = path.join(process.cwd(), 'keywords.json');
+
+async function getKeywords() {
+    try {
+        const data = await fs.readFile(KEYWORDS_PATH, 'utf8');
+        return JSON.parse(data).keywords;
+    } catch (error) {
+        console.error("Error reading keywords file:", error);
+        return [];
+    }
+}
+
+async function saveKeywords(keywords) {
+    try {
+        await fs.writeFile(KEYWORDS_PATH, JSON.stringify({ keywords }, null, 2));
+    } catch (error) {
+        console.error("Error saving keywords file:", error);
+    }
+}
+
 client.once('ready', () => {
     console.log(`Logged in as ${client.user.tag}!`);
 });
 
+/**
+ * Recursively extracts the best plain text content from an email part.
+ * Prioritizes text/plain over text/html. Converts HTML to text if only HTML is available.
+ * @param {object} part The email part to process.
+ * @returns {string} The extracted plain text.
+ */
+function getTextFromEmailPart(part) {
+    if (!part) return '';
+
+    // Decode base64 data
+    const decodeBase64 = (data) => Buffer.from(data, 'base64').toString('utf8');
+
+    if (part.mimeType === 'text/plain' && part.body && part.body.data) {
+        return decodeBase64(part.body.data);
+    }
+
+    if (part.mimeType === 'text/html' && part.body && part.body.data) {
+        // Convert HTML to text if no plain text part is found
+        return convert(decodeBase64(part.body.data), {
+            wordwrap: 130,
+        });
+    }
+
+    if (part.mimeType.startsWith('multipart/') && part.parts) {
+        let plainText = '';
+        let htmlText = '';
+
+        for (const subPart of part.parts) {
+            if (subPart.mimeType === 'text/plain') {
+                plainText += decodeBase64(subPart.body.data);
+            } else if (subPart.mimeType === 'text/html') {
+                htmlText += decodeBase64(subPart.body.data);
+            } else if (subPart.mimeType.startsWith('multipart/')) {
+                // Recursive call for nested multipart parts
+                const nestedText = getTextFromEmailPart(subPart);
+                if (subPart.mimeType.includes('plain')) { // A heuristic to prioritize plain text from nested parts
+                    plainText += nestedText;
+                } else {
+                    htmlText += nestedText;
+                }
+            }
+        }
+        return plainText || (htmlText ? convert(htmlText, { wordwrap: 130 }) : '');
+    }
+
+    return '';
+}
+
+async function scanEmails(channel) {
+    if (!channel) {
+        console.error("ScanEmails was called without a channel.");
+        return;
+    }
+    await channel.send('Scanning emails now...');
+    try {
+        const keywords = await getKeywords();
+        if (keywords.length === 0) {
+            await channel.send("No keywords configured. Please add keywords using `!add_keyword <keyword>`.");
+            return;
+        }
+
+        const query = `is:unread (${keywords.map(k => `subject:(${k}) OR from:(${k})`).join(' OR ')})`;
+        await channel.send(`Using query: \`${query}\``);
+
+        const auth = await authorize();
+        const emails = await getMessages(auth, query);
+
+        console.log(`[DIAGNOSTIC] Found ${emails.length} email(s) matching the query.`);
+
+        if (emails.length === 0) {
+            await channel.send('No unread job-related emails found matching your keywords.');
+            return;
+        }
+
+        for (const email of emails) {
+            console.log(`[DIAGNOSTIC] Processing email ID: ${email.id}`);
+            
+            const emailBody = getTextFromEmailPart(email.payload);
+
+            if (emailBody) {
+                console.log(`[DIAGNOSTIC] Successfully extracted email body for ID: ${email.id}`);
+                const aiResponse = await processEmailWithAI(emailBody);
+
+                if (aiResponse.error) {
+                    await channel.send(`Error processing email: ${aiResponse.error}\nRaw Response: \`${aiResponse.raw_response}\``);
+                    continue;
+                }
+
+                const embed = new EmbedBuilder()
+                    .setColor(aiResponse.urgency_analysis?.is_urgent ? '#FF4500' : '#0099FF')
+                    .setTitle(aiResponse.extracted_entities?.job_title || 'Job Opportunity')
+                    .setAuthor({ name: aiResponse.extracted_entities?.company_name || 'N/A' })
+                    .setDescription(aiResponse.summary || 'No summary available.')
+                    .addFields(
+                        { name: '📍 Location', value: aiResponse.extracted_entities?.location || 'N/A', inline: true },
+                        { name: '💰 Salary', value: aiResponse.extracted_entities?.salary || 'N/A', inline: true },
+                        { name: '🔥 Urgency', value: aiResponse.urgency_analysis?.reason || 'N/A', inline: false },
+                        { name: '▶️ Next Action', value: `**Category:** ${aiResponse.next_action?.category}\n**Details:** ${aiResponse.next_action?.details}` },
+                    )
+                    .setTimestamp();
+                
+                if (aiResponse.draft_reply?.is_needed) {
+                    embed.addFields({ name: '✉️ Suggested Reply', value: aiResponse.draft_reply.suggested_text });
+                }
+
+                await channel.send({ embeds: [embed] });
+            } else {
+                 console.log(`[DIAGNOSTIC] Could not extract plaintext body for email ID: ${email.id}. Skipping.`);
+            }
+        }
+        await channel.send('Finished scanning job-related emails.');
+
+    } catch (error) {
+        console.error('Error during email scan:', error);
+        await channel.send(`An error occurred while scanning emails: ${error.message}`);
+    }
+}
+
 client.on('messageCreate', async message => {
     if (message.author.bot) return;
 
-    if (message.content === '!scan_emails') {
-        await message.reply('Scanning emails now...');
-        try {
-            const auth = await authorize();
-            const emails = await getMessages(auth, 'is:unread subject:"job application" OR subject:"interview" OR subject:"job offer" OR from:linkedin.com');
+    // A simple command parser
+    const content = message.content.startsWith('!') ? message.content : '';
+    const [command, ...args] = content.slice(1).trim().split(/\s+/);
 
-            if (emails.length === 0) {
-                await message.channel.send('No unread job-related emails found.');
-                return;
-            }
 
-            for (const email of emails) {
-                // Extract plaintext body
-                let emailBody = '';
-                if (email.payload && email.payload.parts) {
-                    const part = email.payload.parts.find(p => p.mimeType === 'text/plain');
-                    if (part && part.body && part.body.data) {
-                        emailBody = Buffer.from(part.body.data, 'base64').toString('utf8');
-                    }
-                } else if (email.payload && email.payload.body && email.payload.body.data) {
-                    emailBody = Buffer.from(email.payload.body.data, 'base64').toString('utf8');
-                }
+    if (command === 'scan_emails') {
+        scanEmails(message.channel);
+    }
 
-                if (emailBody) {
-                    const aiResponse = await processEmailWithAI(emailBody);
+    if (command === 'start_scan') {
+        if (scanInterval) {
+            await message.reply('Automatic scanning is already running.');
+            return;
+        }
+        const intervalHours = args[0] ? parseInt(args[0], 10) : 3;
+        if (isNaN(intervalHours) || intervalHours <= 0) {
+            await message.reply("Please provide a valid number of hours for the interval.");
+            return;
+        }
+        await message.reply(`Starting automatic email scanning every ${intervalHours} hour(s).`);
+        scanEmails(message.channel); // Scan immediately on start
+        scanInterval = setInterval(() => scanEmails(message.channel), intervalHours * 60 * 60 * 1000);
+    }
 
-                    // Split the response if it's too long for a single Discord message
-                    const maxChunkSize = 1900;
-                    if (aiResponse.length > maxChunkSize) {
-                        await message.channel.send(`**Subject:** ${email.payload.headers.find(h => h.name === 'Subject').value}\n**From:** ${email.payload.headers.find(h => h.name === 'From').value}\n\n---`);
-                        for (let i = 0; i < aiResponse.length; i += maxChunkSize) {
-                            const chunk = aiResponse.substring(i, i + maxChunkSize);
-                            await message.channel.send(chunk);
-                        }
-                    } else {
-                        await message.channel.send(`**Subject:** ${email.payload.headers.find(h => h.name === 'Subject').value}\n**From:** ${email.payload.headers.find(h => h.name === 'From').value}\n\n${aiResponse}\n\n---`);
-                    }
-                }
-            }
-            await message.channel.send('Finished scanning job-related emails.');
+    if (command === 'stop_scan') {
+        if (scanInterval) {
+            clearInterval(scanInterval);
+            scanInterval = null;
+            await message.reply('Stopped automatic email scanning.');
+        } else {
+            await message.reply('Automatic scanning is not running.');
+        }
+    }
 
-        } catch (error) {
-            console.error('Error during email scan:', error);
-            await message.channel.send(`An error occurred while scanning emails: ${error.message}`);
+    if (command === 'list_keywords') {
+        const keywords = await getKeywords();
+        await message.channel.send(`**Current keywords:**\n- ${keywords.join('\n- ')}`);
+    }
+
+    if (command === 'add_keyword') {
+        const keywordToAdd = args.join(" ");
+        if (!keywordToAdd) {
+            await message.reply("Please provide a keyword to add.");
+            return;
+        }
+        let keywords = await getKeywords();
+        if (!keywords.includes(keywordToAdd)) {
+            keywords.push(keywordToAdd);
+            await saveKeywords(keywords);
+            await message.reply(`Added keyword: \`${keywordToAdd}\``);
+        } else {
+            await message.reply(`Keyword already exists: \`${keywordToAdd}\``);
+        }
+    }
+
+    if (command === 'remove_keyword') {
+        const keywordToRemove = args.join(" ");
+        if (!keywordToRemove) {
+            await message.reply("Please provide a keyword to remove.");
+            return;
+        }
+        let keywords = await getKeywords();
+        const initialLength = keywords.length;
+        keywords = keywords.filter(k => k.toLowerCase() !== keywordToRemove.toLowerCase());
+        if (keywords.length < initialLength) {
+            await saveKeywords(keywords);
+            await message.reply(`Removed keyword: \`${keywordToRemove}\``);
+        } else {
+            await message.reply(`Keyword not found: \`${keywordToRemove}\``);
         }
     }
 });
