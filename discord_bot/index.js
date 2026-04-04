@@ -142,6 +142,13 @@ async function scanEmails(channel) {
             return;
         }
 
+        console.log('[DEBUG] Fetched Email Details:');
+        emails.forEach(email => {
+            const subjectHeader = email.payload.headers.find(header => header.name === 'Subject');
+            const subject = subjectHeader ? subjectHeader.value : 'No Subject';
+            console.log(`- ID: ${email.id}, Subject: "${subject}"`);
+        });
+
         for (const email of emails) {
             console.log(`[DIAGNOSTIC] Processing email ID: ${email.id}`);
             
@@ -156,6 +163,14 @@ async function scanEmails(channel) {
                     continue;
                 }
 
+                // AI-driven filtering: Only send to Discord if job_relevance_score is 5 or higher
+                const MIN_JOB_RELEVANCE_SCORE = 5;
+                if (aiResponse.job_relevance_score < MIN_JOB_RELEVANCE_SCORE) {
+                    console.log(`[DIAGNOSTIC] Skipping email ID: ${email.id} due to low job relevance score (${aiResponse.job_relevance_score}). Reason: ${aiResponse.job_relevance_reason}`);
+                    await channel.send(`_Skipping an email due to low job relevance score (${aiResponse.job_relevance_score}). Reason: ${aiResponse.job_relevance_reason}_`);
+                    continue; // Skip sending this email to Discord
+                }
+
                 const embed = new EmbedBuilder()
                     .setColor(aiResponse.urgency_analysis?.is_urgent ? '#FF4500' : '#0099FF')
                     .setTitle(aiResponse.extracted_entities?.job_title || 'Job Opportunity')
@@ -165,9 +180,13 @@ async function scanEmails(channel) {
                         { name: '📍 Location', value: aiResponse.extracted_entities?.location || 'N/A', inline: true },
                         { name: '💰 Salary', value: aiResponse.extracted_entities?.salary || 'N/A', inline: true },
                         { name: '🔥 Urgency', value: aiResponse.urgency_analysis?.reason || 'N/A', inline: false },
+                        { name: '📊 AI Job Category', value: aiResponse.job_category || 'N/A', inline: false },
+                        { name: '🎯 AI Relevance Score', value: `${aiResponse.job_relevance_score}/10 (${aiResponse.job_relevance_reason || 'No reason provided'})`, inline: false },
                         { name: '▶️ Next Action', value: `**Category:** ${aiResponse.next_action?.category}\n**Details:** ${aiResponse.next_action?.details}` },
                     )
                     .setTimestamp();
+
+
                 
                 if (aiResponse.draft_reply?.is_needed) {
                     embed.addFields({ name: '✉️ Suggested Reply', value: aiResponse.draft_reply.suggested_text });

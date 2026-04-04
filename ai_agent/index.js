@@ -12,6 +12,7 @@ if (!GEMINI_API_KEY || GEMINI_API_KEY === 'YOUR_GEMINI_API_KEY_HERE') {
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
 async function processEmailWithAI(emailContent) {
+    console.log('[DEBUG] AI Input (emailContent):', emailContent); // Log the input
     const prompt = `Analyze the following job-related email and respond ONLY with a valid JSON object. Do not add any text before or after the JSON.
 
 The JSON object should have the following structure:
@@ -34,7 +35,11 @@ The JSON object should have the following structure:
   "draft_reply": {
     "is_needed": "A boolean (true/false) indicating if a reply is recommended.",
     "suggested_text": "If a reply is needed, provide a concise, professional draft. Otherwise, 'N/A'."
-  }
+  },
+  "job_relevance_score": "An integer score from 0 (not relevant) to 10 (highly relevant job opportunity) indicating how directly and strongly this email is related to a job application, interview, or offer.",
+  "job_relevance_reason": "A brief explanation for the 'job_relevance_score'."
+  },
+  "job_category": "Classify the email into one of the following categories: 'Job Offer', 'Interview Invitation', 'Recruiter Outreach', 'Application Confirmation', 'Informational/Newsletter', 'Not Job Related'."
 }
 
 Email Content:
@@ -45,7 +50,7 @@ ${emailContent}
 
     try {
         const response = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',  // or 'gemini-2.5-flash-latest' if you prefer auto-updates
+            model: 'gemini-3.1-flash-lite-preview',  // or 'gemini-2.5-flash-latest' if you prefer auto-updates
             contents: [
                 { role: 'user', parts: [{ text: prompt }] }
             ],
@@ -64,6 +69,7 @@ ${emailContent}
 
         // Clean common markdown fences the model sometimes adds despite instructions
         text = text.replace(/```json/g, '').replace(/```/g, '').trim();
+        console.log('[DEBUG] Raw AI Response Text before JSON.parse:', text);
 
         // Parse to object
         const structuredResponse = JSON.parse(text);
