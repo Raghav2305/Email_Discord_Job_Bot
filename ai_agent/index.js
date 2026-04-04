@@ -2,6 +2,7 @@
 require('dotenv').config();
 
 const { GoogleGenAI } = require('@google/genai');
+const { aiLogger } = require('../logger');
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
@@ -12,7 +13,7 @@ if (!GEMINI_API_KEY || GEMINI_API_KEY === 'YOUR_GEMINI_API_KEY_HERE') {
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
 async function processEmailWithAI(emailContent) {
-    console.log('[DEBUG] AI Input (emailContent):', emailContent); // Log the input
+    aiLogger.info('Processing email with AI', { contentLength: emailContent.length });
     const prompt = `Analyze the following job-related email and respond ONLY with a valid JSON object. Do not add any text before or after the JSON.
 
 The JSON object should have the following structure:
@@ -69,15 +70,19 @@ ${emailContent}
 
         // Clean common markdown fences the model sometimes adds despite instructions
         text = text.replace(/```json/g, '').replace(/```/g, '').trim();
-        console.log('[DEBUG] Raw AI Response Text before JSON.parse:', text);
+        aiLogger.debug('Raw AI Response Text', { text });
 
         // Parse to object
         const structuredResponse = JSON.parse(text);
+        aiLogger.info('AI processing completed successfully', {
+            relevanceScore: structuredResponse.job_relevance_score,
+            category: structuredResponse.job_category,
+        });
 
         return structuredResponse;
 
     } catch (error) {
-        console.error('Error processing email with AI:', error);
+        aiLogger.error('Error processing email with AI', { error: error.message, stack: error.stack });
 
         if (error instanceof SyntaxError) {
             return {

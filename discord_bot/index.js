@@ -3,9 +3,10 @@ require('dotenv').config();
 const fs = require('fs').promises;
 const path = require('path');
 const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
-const { authorize, getMessages } = require('../gmail_service');
+const { authorize, getMessages, createOrGetLabel, addLabelToMessage, markAsRead } = require('../gmail_service');
 const { processEmailWithAI } = require('../ai_agent');
-const { convert } = require('html-to-text'); // Import html-to-text
+const { convert } = require('html-to-text');
+const { discordLogger } = require('../logger');
 
 const client = new Client({
     intents: [
@@ -17,6 +18,8 @@ const client = new Client({
 
 let scanInterval = null;
 const KEYWORDS_PATH = path.join(process.cwd(), 'keywords.json');
+const STATS_PATH = path.join(process.cwd(), 'stats.json');
+const SKIPPED_PATH = path.join(process.cwd(), 'skipped_emails.json');
 
 async function getKeywordConfig() {
     try {
@@ -41,8 +44,87 @@ async function _writeKeywordFile(config) {
     }
 }
 
+async function getStats() {
+    try {
+        const data = await fs.readFile(STATS_PATH, 'utf8');
+        return JSON.parse(data);
+    } catch (error) {
+        discordLogger.warn('Could not read stats file, using defaults');
+        return {
+            last_scan_time: null,
+            total_scans: 0,
+            total_emails_processed: 0,
+            total_emails_relevant: 0,
+            total_emails_skipped: 0,
+            last_error: null,
+            last_error_time: null,
+        };
+    }
+}
+
+async function updateStats({ processed, relevant, skipped, error = null }) {
+    try {
+        const stats = await getStats();
+        stats.last_scan_time = new Date().toISOString();
+        stats.total_scans++;
+        stats.total_emails_processed += processed;
+        stats.total_emails_relevant += relevant;
+        stats.total_emails_skipped += skipped;
+        if (error) {
+            stats.last_error = error.message;
+            stats.last_error_time = new Date().toISOString();
+        }
+        await fs.writeFile(STATS_PATH, JSON.stringify(stats, null, 2));
+    } catch (err) {
+        discordLogger.error('Failed to update stats', { error: err.message });
+    }
+}
+
+async function addSkippedEmail(emailId, subject, sender, aiResponse) {
+    try {
+        let skipped = [];
+        try {
+            const data = await fs.readFile(SKIPPED_PATH, 'utf8');
+            skipped = JSON.parse(data);
+        } catch (e) {
+            // File doesn't exist yet
+        }
+        skipped.unshift({
+            emailId,
+            subject,
+            sender,
+            score: aiResponse.job_relevance_score,
+            reason: aiResponse.job_relevance_reason,
+            category: aiResponse.job_category,
+            timestamp: new Date().toISOString(),
+        });
+        // Keep only last 50 skipped emails
+        skipped = skipped.slice(0, 50);
+        await fs.writeFile(SKIPPED_PATH, JSON.stringify(skipped, null, 2));
+    } catch (err) {
+        discordLogger.error('Failed to track skipped email', { error: err.message });
+    }
+}
+
+async function getSkippedEmails() {
+    try {
+        const data = await fs.readFile(SKIPPED_PATH, 'utf8');
+        return JSON.parse(data);
+    } catch (error) {
+        return [];
+    }
+}
+
+async function clearSkippedEmails() {
+    try {
+        await fs.writeFile(SKIPPED_PATH, JSON.stringify([], null, 2));
+    } catch (err) {
+        discordLogger.error('Failed to clear skipped emails', { error: err.message });
+    }
+}
+
 client.once('ready', () => {
-    console.log(`Logged in as ${client.user.tag}!`);
+    discordLogger.info(`Bot logged in as ${client.user.tag}`);
 });
 
 /**
@@ -95,7 +177,7 @@ function getTextFromEmailPart(part) {
 
 async function scanEmails(channel) {
     if (!channel) {
-        console.error("ScanEmails was called without a channel.");
+        discordLogger.error('scanEmails called without a channel');
         return;
     }
     await channel.send('Scanning emails now...');
@@ -103,6 +185,7 @@ async function scanEmails(channel) {
         const { keywords, exclude_keywords, exclude_senders } = await getKeywordConfig();
 
         if (keywords.length === 0 && exclude_keywords.length === 0 && exclude_senders.length === 0) {
+            discordLogger.warn('No keywords configured for email filtering');
             await channel.send("No keywords configured (positive or negative). Please add keywords using `!add_keyword <keyword>`.");
             return;
         }
@@ -129,36 +212,39 @@ async function scanEmails(channel) {
         if (negativeSenderQuery) queryParts.push(negativeSenderQuery);
 
         const finalQuery = queryParts.join(' ');
-        
+
         await channel.send(`Using query: \`${finalQuery}\``);
 
         const auth = await authorize();
         const emails = await getMessages(auth, finalQuery);
 
-        console.log(`[DIAGNOSTIC] Found ${emails.length} email(s) matching the query.`);
+        discordLogger.info('Emails fetched from Gmail', { count: emails.length, query: finalQuery });
 
         if (emails.length === 0) {
             await channel.send('No unread job-related emails found matching your keywords.');
             return;
         }
 
-        console.log('[DEBUG] Fetched Email Details:');
-        emails.forEach(email => {
-            const subjectHeader = email.payload.headers.find(header => header.name === 'Subject');
-            const subject = subjectHeader ? subjectHeader.value : 'No Subject';
-            console.log(`- ID: ${email.id}, Subject: "${subject}"`);
-        });
+        discordLogger.debug('Fetched email details', { emails: emails.map(e => ({
+            id: e.id,
+            subject: e.payload.headers?.find(h => h.name === 'Subject')?.value || 'No Subject'
+        })) });
+
+        let processedCount = 0;
+        let relevantCount = 0;
+        let skippedCount = 0;
 
         for (const email of emails) {
-            console.log(`[DIAGNOSTIC] Processing email ID: ${email.id}`);
-            
+            discordLogger.info('Processing email', { emailId: email.id });
+
             const emailBody = getTextFromEmailPart(email.payload);
 
             if (emailBody) {
-                console.log(`[DIAGNOSTIC] Successfully extracted email body for ID: ${email.id}`);
+                discordLogger.debug('Email body extracted', { emailId: email.id, bodyLength: emailBody.length });
                 const aiResponse = await processEmailWithAI(emailBody);
 
                 if (aiResponse.error) {
+                    discordLogger.error('AI processing failed', { emailId: email.id, error: aiResponse.error });
                     await channel.send(`Error processing email: ${aiResponse.error}\nRaw Response: \`${aiResponse.raw_response}\``);
                     continue;
                 }
@@ -166,10 +252,24 @@ async function scanEmails(channel) {
                 // AI-driven filtering: Only send to Discord if job_relevance_score is 5 or higher
                 const MIN_JOB_RELEVANCE_SCORE = 5;
                 if (aiResponse.job_relevance_score < MIN_JOB_RELEVANCE_SCORE) {
-                    console.log(`[DIAGNOSTIC] Skipping email ID: ${email.id} due to low job relevance score (${aiResponse.job_relevance_score}). Reason: ${aiResponse.job_relevance_reason}`);
+                    discordLogger.info('Skipping email - low relevance', {
+                        emailId: email.id,
+                        score: aiResponse.job_relevance_score,
+                        reason: aiResponse.job_relevance_reason
+                    });
+                    skippedCount++;
+                    // Get sender for tracking
+                    const fromHeader = email.payload.headers?.find(h => h.name === 'From');
+                    const sender = fromHeader ? fromHeader.value : 'Unknown';
+                    const subjectHeader = email.payload.headers?.find(h => h.name === 'Subject');
+                    const subject = subjectHeader ? subjectHeader.value : 'No Subject';
+
+                    await addSkippedEmail(email.id, subject, sender, aiResponse);
                     await channel.send(`_Skipping an email due to low job relevance score (${aiResponse.job_relevance_score}). Reason: ${aiResponse.job_relevance_reason}_`);
-                    continue; // Skip sending this email to Discord
+                    continue;
                 }
+
+                relevantCount++;
 
                 const embed = new EmbedBuilder()
                     .setColor(aiResponse.urgency_analysis?.is_urgent ? '#FF4500' : '#0099FF')
@@ -193,14 +293,22 @@ async function scanEmails(channel) {
                 }
 
                 await channel.send({ embeds: [embed] });
+                processedCount++;
             } else {
-                 console.log(`[DIAGNOSTIC] Could not extract plaintext body for email ID: ${email.id}. Skipping.`);
+                discordLogger.warn('Could not extract plaintext body', { emailId: email.id });
+                skippedCount++;
             }
         }
+
+        const summary = `Scan complete! **Processed:** ${processedCount} | **Relevant:** ${relevantCount} | **Skipped:** ${skippedCount}`;
+        discordLogger.info('Email scan completed', { processed: processedCount, relevant: relevantCount, skipped: skippedCount });
+        await channel.send(summary);
+        await updateStats({ processed: processedCount, relevant: relevantCount, skipped: skippedCount });
         await channel.send('Finished scanning job-related emails.');
 
     } catch (error) {
-        console.error('Error during email scan:', error);
+        discordLogger.error('Error during email scan', { error: error.message, stack: error.stack });
+        await updateStats({ processed: 0, relevant: 0, skipped: 0, error });
         await channel.send(`An error occurred while scanning emails: ${error.message}`);
     }
 }
@@ -228,7 +336,8 @@ client.on('messageCreate', async message => {
             return;
         }
         await message.reply(`Starting automatic email scanning every ${intervalHours} hour(s).`);
-        scanEmails(message.channel); // Scan immediately on start
+        discordLogger.info('Starting automatic email scanning', { intervalHours });
+        scanEmails(message.channel);
         scanInterval = setInterval(() => scanEmails(message.channel), intervalHours * 60 * 60 * 1000);
     }
 
@@ -236,6 +345,7 @@ client.on('messageCreate', async message => {
         if (scanInterval) {
             clearInterval(scanInterval);
             scanInterval = null;
+            discordLogger.info('Stopped automatic email scanning');
             await message.reply('Stopped automatic email scanning.');
         } else {
             await message.reply('Automatic scanning is not running.');
@@ -261,6 +371,61 @@ client.on('messageCreate', async message => {
             reply += 'No excluded senders configured.\n';
         }
         await message.channel.send(reply);
+    }
+
+    if (command === 'status') {
+        const stats = await getStats();
+        const lastScan = stats.last_scan_time
+            ? new Date(stats.last_scan_time).toLocaleString()
+            : 'Never';
+        const lastError = stats.last_error
+            ? `${stats.last_error} (${new Date(stats.last_error_time).toLocaleString()})`
+            : 'None';
+
+        const reply = [
+            '**Bot Status**',
+            `**Last Scan:** ${lastScan}`,
+            `**Total Scans:** ${stats.total_scans}`,
+            `**Total Emails Processed:** ${stats.total_emails_processed}`,
+            `**Total Relevant:** ${stats.total_emails_relevant}`,
+            `**Total Skipped:** ${stats.total_emails_skipped}`,
+            `**Last Error:** ${lastError}`,
+        ].join('\n');
+        await message.channel.send(reply);
+    }
+
+    if (command === 'preview_skipped') {
+        const skipped = await getSkippedEmails();
+        const limit = args[0] ? parseInt(args[0], 10) : 10;
+
+        if (skipped.length === 0) {
+            await message.reply('No skipped emails to show.');
+            return;
+        }
+
+        const toShow = skipped.slice(0, Math.min(limit, skipped.length));
+        const reply = [
+            `**Recently Skipped Emails** (showing ${toShow.length} of ${skipped.length}):`,
+            '',
+            ...toShow.map((email, i) => {
+                return [
+                    `**${i + 1}.** ${email.subject}`,
+                    `   From: ${email.sender}`,
+                    `   Score: ${email.score}/10 | Category: ${email.category}`,
+                    `   Reason: ${email.reason}`,
+                    `   Time: ${new Date(email.timestamp).toLocaleString()}`,
+                ].join('\n');
+            }),
+            '',
+            `_Use !clear_skipped to reset this list_`,
+        ].join('\n');
+
+        await message.channel.send(reply);
+    }
+
+    if (command === 'clear_skipped') {
+        await clearSkippedEmails();
+        await message.reply('Cleared the skipped emails list.');
     }
 
     if (command === 'add_keyword') {
