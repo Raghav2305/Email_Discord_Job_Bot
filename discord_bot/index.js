@@ -18,21 +18,26 @@ const client = new Client({
 let scanInterval = null;
 const KEYWORDS_PATH = path.join(process.cwd(), 'keywords.json');
 
-async function getKeywords() {
+async function getKeywordConfig() {
     try {
         const data = await fs.readFile(KEYWORDS_PATH, 'utf8');
-        return JSON.parse(data).keywords;
+        const config = JSON.parse(data);
+        return {
+            keywords: config.keywords || [],
+            exclude_keywords: config.exclude_keywords || [],
+            exclude_senders: config.exclude_senders || [],
+        };
     } catch (error) {
-        console.error("Error reading keywords file:", error);
-        return [];
+        console.error("Error reading keywords config file:", error);
+        return { keywords: [], exclude_keywords: [], exclude_senders: [] };
     }
 }
 
-async function saveKeywords(keywords) {
+async function _writeKeywordFile(config) {
     try {
-        await fs.writeFile(KEYWORDS_PATH, JSON.stringify({ keywords }, null, 2));
+        await fs.writeFile(KEYWORDS_PATH, JSON.stringify(config, null, 2));
     } catch (error) {
-        console.error("Error saving keywords file:", error);
+        console.error("Error writing keywords config file:", error);
     }
 }
 
@@ -95,17 +100,40 @@ async function scanEmails(channel) {
     }
     await channel.send('Scanning emails now...');
     try {
-        const keywords = await getKeywords();
-        if (keywords.length === 0) {
-            await channel.send("No keywords configured. Please add keywords using `!add_keyword <keyword>`.");
+        const { keywords, exclude_keywords, exclude_senders } = await getKeywordConfig();
+
+        if (keywords.length === 0 && exclude_keywords.length === 0 && exclude_senders.length === 0) {
+            await channel.send("No keywords configured (positive or negative). Please add keywords using `!add_keyword <keyword>`.");
             return;
         }
 
-        const query = `is:unread (${keywords.map(k => `subject:(${k}) OR from:(${k})`).join(' OR ')})`;
-        await channel.send(`Using query: \`${query}\``);
+        // Build positive query part
+        const positiveQuery = keywords.length > 0
+            ? `(${keywords.map(k => `subject:(${k}) OR from:(${k})`).join(' OR ')})`
+            : '';
+
+        // Build negative query part for keywords
+        const negativeKeywordQuery = exclude_keywords.length > 0
+            ? exclude_keywords.map(k => `-subject:(${k}) -from:(${k})`).join(' ')
+            : '';
+        
+        // Build negative query part for senders
+        const negativeSenderQuery = exclude_senders.length > 0
+            ? exclude_senders.map(s => `-from:(${s})`).join(' ')
+            : '';
+
+        // Combine all parts into the final query
+        let queryParts = ['is:unread'];
+        if (positiveQuery) queryParts.push(positiveQuery);
+        if (negativeKeywordQuery) queryParts.push(negativeKeywordQuery);
+        if (negativeSenderQuery) queryParts.push(negativeSenderQuery);
+
+        const finalQuery = queryParts.join(' ');
+        
+        await channel.send(`Using query: \`${finalQuery}\``);
 
         const auth = await authorize();
-        const emails = await getMessages(auth, query);
+        const emails = await getMessages(auth, finalQuery);
 
         console.log(`[DIAGNOSTIC] Found ${emails.length} email(s) matching the query.`);
 
@@ -196,8 +224,24 @@ client.on('messageCreate', async message => {
     }
 
     if (command === 'list_keywords') {
-        const keywords = await getKeywords();
-        await message.channel.send(`**Current keywords:**\n- ${keywords.join('\n- ')}`);
+        const { keywords, exclude_keywords, exclude_senders } = await getKeywordConfig();
+        let reply = '**Current Keywords:**\n';
+        if (keywords.length > 0) {
+            reply += `**Positive:**\n- ${keywords.join('\n- ')}\n`;
+        } else {
+            reply += 'No positive keywords configured.\n';
+        }
+        if (exclude_keywords.length > 0) {
+            reply += `**Excluded (keywords):**\n- ${exclude_keywords.join('\n- ')}\n`;
+        } else {
+            reply += 'No excluded keywords configured.\n';
+        }
+        if (exclude_senders.length > 0) {
+            reply += `**Excluded (senders):**\n- ${exclude_senders.join('\n- ')}\n`;
+        } else {
+            reply += 'No excluded senders configured.\n';
+        }
+        await message.channel.send(reply);
     }
 
     if (command === 'add_keyword') {
@@ -206,10 +250,10 @@ client.on('messageCreate', async message => {
             await message.reply("Please provide a keyword to add.");
             return;
         }
-        let keywords = await getKeywords();
-        if (!keywords.includes(keywordToAdd)) {
-            keywords.push(keywordToAdd);
-            await saveKeywords(keywords);
+        let config = await getKeywordConfig(); // Get full config
+        if (!config.keywords.includes(keywordToAdd)) {
+            config.keywords.push(keywordToAdd);
+            await _writeKeywordFile(config); // Save full config
             await message.reply(`Added keyword: \`${keywordToAdd}\``);
         } else {
             await message.reply(`Keyword already exists: \`${keywordToAdd}\``);
@@ -222,11 +266,11 @@ client.on('messageCreate', async message => {
             await message.reply("Please provide a keyword to remove.");
             return;
         }
-        let keywords = await getKeywords();
-        const initialLength = keywords.length;
-        keywords = keywords.filter(k => k.toLowerCase() !== keywordToRemove.toLowerCase());
-        if (keywords.length < initialLength) {
-            await saveKeywords(keywords);
+        let config = await getKeywordConfig(); // Get full config
+        const initialLength = config.keywords.length;
+        config.keywords = config.keywords.filter(k => k.toLowerCase() !== keywordToRemove.toLowerCase());
+        if (config.keywords.length < initialLength) {
+            await _writeKeywordFile(config); // Save full config
             await message.reply(`Removed keyword: \`${keywordToRemove}\``);
         } else {
             await message.reply(`Keyword not found: \`${keywordToRemove}\``);

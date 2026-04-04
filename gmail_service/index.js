@@ -14,21 +14,6 @@ const TOKEN_PATH = path.join(process.cwd(), 'gmail_service', 'token.json');
 const CREDENTIALS_PATH = path.join(process.cwd(), 'gmail_service', 'credentials.json');
 
 /**
- * Reads previously authorized credentials from the save file.
- *
- * @return {Promise<OAuth2Client|null>}
- */
-async function loadSavedCredentialsIfExist() {
-    try {
-        const content = await fs.readFile(TOKEN_PATH);
-        const credentials = JSON.parse(content);
-        return google.auth.fromJSON(credentials);
-    } catch (err) {
-        return null;
-    }
-}
-
-/**
  * Serializes credentials to a file compatible with GoogleAuth.fromJSON.
  *
  * @param {OAuth2Client} client
@@ -39,23 +24,23 @@ async function saveCredentials(client) {
         type: 'authorized_user',
         ...client.credentials,
     });
-    await fs.writeFile(TOKEN_PATH, payload);
+    try {
+        await fs.writeFile(TOKEN_PATH, payload);
+        console.log('[DEBUG] Credentials saved to token.json. Refresh token present:', !!client.credentials.refresh_token);
+    } catch (error) {
+        console.error('[DEBUG] Error saving credentials to token.json:', error);
+    }
 }
 
 /**
- * Load or request authorization to call APIs.
+ * Reads previously authorized credentials from the save file.
  *
+ * @return {Promise<OAuth2Client|null>}
  */
 async function authorize() {
-    let client = await loadSavedCredentialsIfExist();
-    if (client) {
-        // Check if the token is expired, and if so, refresh it
-        const tokens = await client.getAccessToken();
-        client.setCredentials(tokens);
-        return client;
-    }
+    console.log('[DEBUG] Starting authorization process...');
 
-    // If no client, or if client is unauthorized, re-authenticate
+    // Always load client configuration from credentials.json first
     const content = await fs.readFile(CREDENTIALS_PATH);
     const keys = JSON.parse(content);
     const key = keys.installed || keys.web;
@@ -63,19 +48,47 @@ async function authorize() {
     const client_secret = key.client_secret;
     const redirect_uris = key.redirect_uris;
 
-    const authClient = new google.auth.OAuth2(client_id, client_secret, redirect_uris ? redirect_uris[0] : 'http://localhost');
+    const authClient = new google.auth.OAuth2(
+        client_id,
+        client_secret,
+        redirect_uris ? redirect_uris[0] : 'http://localhost'
+    );
 
-    const newClient = await authenticate({
-        scopes: SCOPES,
-        keyfilePath: CREDENTIALS_PATH,
-    });
-
-    authClient.setCredentials(newClient.credentials);
-
-    if (authClient.credentials) {
-        await saveCredentials(authClient);
+    // Now try to load saved user tokens (access and refresh tokens)
+    let loadedTokens = null;
+    try {
+        const tokenContent = await fs.readFile(TOKEN_PATH);
+        loadedTokens = JSON.parse(tokenContent);
+        console.log('[DEBUG] Successfully loaded tokens from token.json');
+    } catch (err) {
+        console.log('[DEBUG] No saved token file found or error reading token.json:', err.message);
     }
-    return authClient;
+
+    if (loadedTokens && loadedTokens.refresh_token) {
+        // If tokens are loaded and a refresh token is present, set them on the authClient
+        authClient.setCredentials(loadedTokens);
+        console.log('[DEBUG] Client credentials set from token.json. Attempting to refresh access token if needed...');
+        // getAccessToken will refresh the token if expired and update authClient.credentials internally
+        await authClient.getAccessToken();
+        // Persist the potentially refreshed tokens to token.json
+        await saveCredentials(authClient);
+        console.log('[DEBUG] Authorization successful using saved credentials.');
+        return authClient;
+    } else {
+        console.log('[DEBUG] No valid saved tokens found or refresh token missing. Initiating new authorization flow...');
+        // If no valid saved tokens or refresh token is missing, proceed with new interactive authentication
+        const newClient = await authenticate({
+            scopes: SCOPES,
+            keyfilePath: CREDENTIALS_PATH,
+        });
+        authClient.setCredentials(newClient.credentials); // Set the newly obtained credentials
+
+        if (authClient.credentials) {
+            await saveCredentials(authClient);
+            console.log('[DEBUG] Initial authorization successful. Credentials saved.');
+        }
+        return authClient;
+    }
 }
 
 /**
