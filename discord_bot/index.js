@@ -17,9 +17,37 @@ const client = new Client({
 });
 
 let scanInterval = null;
+let botOwner = null; // Will be set when bot is ready
 const KEYWORDS_PATH = path.join(process.cwd(), 'keywords.json');
 const STATS_PATH = path.join(process.cwd(), 'stats.json');
 const SKIPPED_PATH = path.join(process.cwd(), 'skipped_emails.json');
+
+/**
+ * Send an error notification to the bot owner via DM.
+ * @param {string} errorMessage - The error message to send
+ * @param {string} context - Additional context about where the error occurred
+ */
+async function notifyOwner(errorMessage, context = '') {
+    if (!botOwner) {
+        discordLogger.warn('Cannot notify owner - bot owner not set');
+        return;
+    }
+
+    try {
+        const dmChannel = await botOwner.createDM();
+        const embed = new EmbedBuilder()
+            .setColor('#FF0000')
+            .setTitle('⚠️ Bot Error Notification')
+            .setDescription(`**Error:** ${errorMessage}`)
+            .addFields({ name: 'Context', value: context || 'General error' })
+            .setTimestamp();
+
+        await dmChannel.send({ embeds: [embed] });
+        discordLogger.info('Error notification sent to owner', { context });
+    } catch (err) {
+        discordLogger.error('Failed to send error notification to owner', { error: err.message });
+    }
+}
 
 async function getKeywordConfig() {
     try {
@@ -123,8 +151,20 @@ async function clearSkippedEmails() {
     }
 }
 
-client.once('ready', () => {
+client.once('ready', async () => {
     discordLogger.info(`Bot logged in as ${client.user.tag}`);
+
+    // Find and store the bot owner (first user in a DM with the bot, or you can hardcode an ID)
+    // For now, we'll try to get the owner from the application info
+    try {
+        const appInfo = await client.application.fetch();
+        botOwner = appInfo.owner;
+        if (botOwner) {
+            discordLogger.info(`Bot owner identified: ${botOwner.tag}`);
+        }
+    } catch (err) {
+        discordLogger.warn('Could not fetch bot owner', { error: err.message });
+    }
 });
 
 /**
@@ -175,12 +215,12 @@ function getTextFromEmailPart(part) {
     return '';
 }
 
-async function scanEmails(channel) {
+async function scanEmails(channel, maxResults = 10) {
     if (!channel) {
         discordLogger.error('scanEmails called without a channel');
         return;
     }
-    await channel.send('Scanning emails now...');
+    await channel.send(`Scanning emails now... (max: ${maxResults} results)`);
     try {
         const { keywords, exclude_keywords, exclude_senders } = await getKeywordConfig();
 
@@ -215,8 +255,25 @@ async function scanEmails(channel) {
 
         await channel.send(`Using query: \`${finalQuery}\``);
 
-        const auth = await authorize();
-        const emails = await getMessages(auth, finalQuery);
+        let auth;
+        try {
+            auth = await authorize();
+        } catch (authError) {
+            discordLogger.error('Gmail authorization failed', { error: authError.message });
+            await channel.send('Failed to authenticate with Gmail. Please check your credentials.');
+            await notifyOwner('Gmail authorization failed', authError.message);
+            return;
+        }
+
+        let emails;
+        try {
+            emails = await getMessages(auth, finalQuery, maxResults);
+        } catch (fetchError) {
+            discordLogger.error('Failed to fetch emails from Gmail', { error: fetchError.message });
+            await channel.send('Failed to fetch emails from Gmail.');
+            await notifyOwner('Failed to fetch emails from Gmail', fetchError.message);
+            return;
+        }
 
         discordLogger.info('Emails fetched from Gmail', { count: emails.length, query: finalQuery });
 
@@ -246,6 +303,7 @@ async function scanEmails(channel) {
                 if (aiResponse.error) {
                     discordLogger.error('AI processing failed', { emailId: email.id, error: aiResponse.error });
                     await channel.send(`Error processing email: ${aiResponse.error}\nRaw Response: \`${aiResponse.raw_response}\``);
+                    await notifyOwner(`AI failed to process email: ${aiResponse.error}`, `Email ID: ${email.id}`);
                     continue;
                 }
 
@@ -266,10 +324,30 @@ async function scanEmails(channel) {
 
                     await addSkippedEmail(email.id, subject, sender, aiResponse);
                     await channel.send(`_Skipping an email due to low job relevance score (${aiResponse.job_relevance_score}). Reason: ${aiResponse.job_relevance_reason}_`);
+
+                    // Still label and mark skipped emails as read so they're not reprocessed
+                    try {
+                        const labelId = await createOrGetLabel(auth, 'Processed by Bot');
+                        await addLabelToMessage(auth, email.id, labelId);
+                        await markAsRead(auth, email.id);
+                        discordLogger.debug('Skipped email labeled and marked as read', { emailId: email.id });
+                    } catch (labelError) {
+                        discordLogger.warn('Failed to label/mark skipped email', { emailId: email.id, error: labelError.message });
+                    }
                     continue;
                 }
 
                 relevantCount++;
+
+                // Label the email as processed and mark as read
+                try {
+                    const labelId = await createOrGetLabel(auth, 'Processed by Bot');
+                    await addLabelToMessage(auth, email.id, labelId);
+                    await markAsRead(auth, email.id);
+                    discordLogger.debug('Email labeled and marked as read', { emailId: email.id });
+                } catch (labelError) {
+                    discordLogger.warn('Failed to label/mark email', { emailId: email.id, error: labelError.message });
+                }
 
                 const embed = new EmbedBuilder()
                     .setColor(aiResponse.urgency_analysis?.is_urgent ? '#FF4500' : '#0099FF')
@@ -310,6 +388,7 @@ async function scanEmails(channel) {
         discordLogger.error('Error during email scan', { error: error.message, stack: error.stack });
         await updateStats({ processed: 0, relevant: 0, skipped: 0, error });
         await channel.send(`An error occurred while scanning emails: ${error.message}`);
+        await notifyOwner(`Email scan failed: ${error.message}`, `Channel: ${channel.id}, Query: ${finalQuery || 'N/A'}`);
     }
 }
 
@@ -322,7 +401,12 @@ client.on('messageCreate', async message => {
 
 
     if (command === 'scan_emails') {
-        scanEmails(message.channel);
+        const maxResults = args[0] ? parseInt(args[0], 10) : 10;
+        if (isNaN(maxResults) || maxResults <= 0) {
+            await message.reply("Please provide a valid number for max results.");
+            return;
+        }
+        scanEmails(message.channel, maxResults);
     }
 
     if (command === 'start_scan') {
@@ -331,14 +415,19 @@ client.on('messageCreate', async message => {
             return;
         }
         const intervalHours = args[0] ? parseInt(args[0], 10) : 3;
+        const maxResults = args[1] ? parseInt(args[1], 10) : 10;
         if (isNaN(intervalHours) || intervalHours <= 0) {
             await message.reply("Please provide a valid number of hours for the interval.");
             return;
         }
-        await message.reply(`Starting automatic email scanning every ${intervalHours} hour(s).`);
-        discordLogger.info('Starting automatic email scanning', { intervalHours });
-        scanEmails(message.channel);
-        scanInterval = setInterval(() => scanEmails(message.channel), intervalHours * 60 * 60 * 1000);
+        if (isNaN(maxResults) || maxResults <= 0) {
+            await message.reply("Please provide a valid number for max results.");
+            return;
+        }
+        await message.reply(`Starting automatic email scanning every ${intervalHours} hour(s) (max ${maxResults} results per scan).`);
+        discordLogger.info('Starting automatic email scanning', { intervalHours, maxResults });
+        scanEmails(message.channel, maxResults);
+        scanInterval = setInterval(() => scanEmails(message.channel, maxResults), intervalHours * 60 * 60 * 1000);
     }
 
     if (command === 'stop_scan') {
@@ -404,23 +493,28 @@ client.on('messageCreate', async message => {
         }
 
         const toShow = skipped.slice(0, Math.min(limit, skipped.length));
-        const reply = [
+
+        // Compact format: just title, score/category, and reason
+        const lines = [
             `**Recently Skipped Emails** (showing ${toShow.length} of ${skipped.length}):`,
             '',
             ...toShow.map((email, i) => {
-                return [
-                    `**${i + 1}.** ${email.subject}`,
-                    `   From: ${email.sender}`,
-                    `   Score: ${email.score}/10 | Category: ${email.category}`,
-                    `   Reason: ${email.reason}`,
-                    `   Time: ${new Date(email.timestamp).toLocaleString()}`,
-                ].join('\n');
+                return `**${i + 1}.** ${email.subject}\n   \u2022 Score: ${email.score}/10 (${email.category})\n   \u2022 Reason: ${email.reason}`;
             }),
             '',
-            `_Use !clear_skipped to reset this list_`,
-        ].join('\n');
+            `_Use !clear_skipped to reset_`,
+        ];
 
-        await message.channel.send(reply);
+        const reply = lines.join('\n');
+
+        // Split if still too long
+        if (reply.length <= 2000) {
+            await message.channel.send(reply);
+        } else {
+            const mid = Math.floor(reply.length / 2);
+            await message.channel.send(reply.slice(0, mid) + '... (continued)');
+            await message.channel.send('...(continued)\n\n' + reply.slice(mid));
+        }
     }
 
     if (command === 'clear_skipped') {

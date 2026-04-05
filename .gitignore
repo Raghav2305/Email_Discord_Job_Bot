@@ -4,3 +4,5 @@ error.txt
 /gmail_service/credentials.json
 /gmail_service/token.json
 /logs/
+/stats.json
+/skipped_emails.json

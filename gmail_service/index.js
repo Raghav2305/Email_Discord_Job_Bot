@@ -7,7 +7,8 @@ const { google } = require('googleapis');
 const { gmailLogger } = require('../logger');
 
 // If modifying these scopes, delete token.json.
-const SCOPES = ['https://www.googleapis.com/auth/gmail.readonly'];
+// Using gmail.modify instead of gmail.readonly to allow labeling and marking emails as read
+const SCOPES = ['https://www.googleapis.com/auth/gmail.modify'];
 // The file token.json stores the user's access and refresh tokens, and is
 // created automatically when the authorization flow completes for the first
 // time.
@@ -114,14 +115,15 @@ async function listLabels(auth) {
  *
  * @param {google.auth.OAuth2} auth An authorized OAuth2 client.
  * @param {string} query The search query for emails (e.g., "subject:job application").
+ * @param {number} maxResults Maximum number of messages to return (default: 10, max: 500).
  * @return {Promise<Array<Object>>} A list of messages, each with its ID and payload.
  */
-async function getMessages(auth, query) {
+async function getMessages(auth, query, maxResults = 5) {
     const gmail = google.gmail({ version: 'v1', auth });
     const res = await gmail.users.messages.list({
         userId: 'me',
-        q: query, // Apply the query here
-        // Removed maxResults limit for debugging
+        q: query,
+        maxResults: Math.min(maxResults, 500), // Gmail API max is 500
     });
     const messages = res.data.messages;
 
