@@ -1,0 +1,34 @@
+{
+  "keywords": [
+    "job application",
+    "interview",
+    "job offer",
+    "LinkedIn",
+    "linkedin",
+    "naukri",
+    "indeed",
+    "recruiter",
+    "apply",
+    "resume",
+    "cv",
+    "cover letter",
+    "hiring",
+    "talent acquisition",
+    "human resources",
+    "career"
+  ],
+  "exclude_keywords": [
+    "zomato",
+    "goibibo",
+    "order",
+    "confirmation",
+    "discount",
+    "promotion",
+    "newsletter",
+    "noreply"
+  ],
+  "exclude_senders": [
+    "noreply@zomato.com",
+    "info@goibibo.com"
+  ]
+}
