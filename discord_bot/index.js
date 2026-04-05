@@ -400,6 +400,28 @@ client.on('messageCreate', async message => {
     const [command, ...args] = content.slice(1).trim().split(/\s+/);
 
 
+    if (command === 'help') {
+        const helpText = [
+            '**Email Bot Commands**',
+            '',
+            '**Scanning**',
+            '`!scan_emails [max]` - Scan emails now (default: 5 results)',
+            '`!start_scan <hours> [max]` - Auto-scan every X hours',
+            '`!stop_scan` - Stop automatic scanning',
+            '',
+            '**Info**',
+            '`!status` - Show bot stats',
+            '`!preview_skipped [limit]` - View skipped emails',
+            '`!clear_skipped` - Clear skipped emails list',
+            '`!list_keywords` - Show all keywords',
+            '',
+            '**Keywords**',
+            '`!add_keyword <text>` - Add a keyword',
+            '`!remove_keyword <text>` - Remove a keyword',
+        ].join('\n');
+        await message.channel.send(helpText);
+    }
+
     if (command === 'scan_emails') {
         const maxResults = args[0] ? parseInt(args[0], 10) : 10;
         if (isNaN(maxResults) || maxResults <= 0) {
