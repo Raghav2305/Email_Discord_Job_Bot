@@ -72,8 +72,30 @@ ${emailContent}
         text = text.replace(/```json/g, '').replace(/```/g, '').trim();
         aiLogger.debug('Raw AI Response Text', { text });
 
+        // Fix: Extract only the valid JSON part if there's trailing garbage
+        // Look for the last closing brace and take everything up to that
+        const lastBraceIndex = text.lastIndexOf('}');
+        if (lastBraceIndex !== -1 && lastBraceIndex < text.length - 1) {
+            text = text.substring(0, lastBraceIndex + 1);
+            aiLogger.debug('Trimmed trailing garbage from AI response');
+        }
+
         // Parse to object
-        const structuredResponse = JSON.parse(text);
+        let structuredResponse;
+        try {
+            structuredResponse = JSON.parse(text);
+        } catch (parseError) {
+            aiLogger.warn('Initial JSON parse failed, attempting recovery');
+            // Try to find JSON object between first { and last }
+            const firstBrace = text.indexOf('{');
+            if (firstBrace !== -1 && lastBraceIndex !== -1 && lastBraceIndex > firstBrace) {
+                const extractedJson = text.substring(firstBrace, lastBraceIndex + 1);
+                structuredResponse = JSON.parse(extractedJson);
+                aiLogger.info('Successfully extracted JSON from malformed response');
+            } else {
+                throw parseError;
+            }
+        }
         aiLogger.info('AI processing completed successfully', {
             relevanceScore: structuredResponse.job_relevance_score,
             category: structuredResponse.job_category,

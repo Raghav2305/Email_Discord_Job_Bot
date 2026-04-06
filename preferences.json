@@ -1,0 +1,9 @@
+{
+  "remote_only": false,
+  "min_salary": null,
+  "preferred_locations": [],
+  "auto_reject_categories": ["Informational/Newsletter"],
+  "min_relevance_score": 5,
+  "preferred_companies": [],
+  "blacklist_companies": []
+}
